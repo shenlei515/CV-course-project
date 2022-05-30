@@ -9,6 +9,8 @@ from basicsr.utils.img_process_util import filter2D
 from basicsr.utils.registry import MODEL_REGISTRY
 from collections import OrderedDict
 from torch.nn import functional as F
+from CMDSR import *
+from Task_Contrastive_Loss import TaskContrastiveLoss
 
 
 @MODEL_REGISTRY.register()
@@ -25,6 +27,19 @@ class RealESRGANModel(SRGANModel):
         self.jpeger = DiffJPEG(differentiable=False).cuda()  # simulate JPEG compression artifacts
         self.usm_sharpener = USMSharp().cuda()  # do usm sharpening
         self.queue_size = opt.get('queue_size', 180)
+        # add conditionNet
+        self.n_block = 2
+        self.n_conv_each_block = 10
+        self.conv_index = 10
+        self.channels = 64
+        self.support_size = 32
+        self.Condition = ConditionNet(n_block=self.n_block, n_conv_each_block=self.n_conv_each_block,
+                                      conv_index=self.conv_index,
+                                      sr_in_channel=self.channels, support_size=self.support_size)
+
+        self.Modulation = Modulations(n_conv_each_block=self.n_conv_each_block, conv_index=self.conv_index,
+                                      sr_in_channel=self.channels)
+        self.support_pool={}
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self):
@@ -85,10 +100,13 @@ class RealESRGANModel(SRGANModel):
             updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob'])[0]
             if updown_type == 'up':
                 scale = np.random.uniform(1, self.opt['resize_range'][1])
+                kind='up'
             elif updown_type == 'down':
                 scale = np.random.uniform(self.opt['resize_range'][0], 1)
+                kind='down'
             else:
                 scale = 1
+                kind = 'eq'
             mode = random.choice(['area', 'bilinear', 'bicubic'])
             out = F.interpolate(out, scale_factor=scale, mode=mode)
             # add noise
@@ -96,6 +114,7 @@ class RealESRGANModel(SRGANModel):
             if np.random.uniform() < self.opt['gaussian_noise_prob']:
                 out = random_add_gaussian_noise_pt(
                     out, sigma_range=self.opt['noise_range'], clip=True, rounds=False, gray_prob=gray_noise_prob)
+                kind+='_gauss'
             else:
                 out = random_add_poisson_noise_pt(
                     out,
@@ -103,6 +122,7 @@ class RealESRGANModel(SRGANModel):
                     gray_prob=gray_noise_prob,
                     clip=True,
                     rounds=False)
+                kind+='_poisson'
             # JPEG compression
             jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range'])
             out = torch.clamp(out, 0, 1)  # clamp to [0, 1], otherwise JPEGer will result in unpleasant artifacts
@@ -116,10 +136,13 @@ class RealESRGANModel(SRGANModel):
             updown_type = random.choices(['up', 'down', 'keep'], self.opt['resize_prob2'])[0]
             if updown_type == 'up':
                 scale = np.random.uniform(1, self.opt['resize_range2'][1])
+                kind+='_up'
             elif updown_type == 'down':
                 scale = np.random.uniform(self.opt['resize_range2'][0], 1)
+                kind+='_down'
             else:
                 scale = 1
+                kind+='_eq'
             mode = random.choice(['area', 'bilinear', 'bicubic'])
             out = F.interpolate(
                 out, size=(int(ori_h / self.opt['scale'] * scale), int(ori_w / self.opt['scale'] * scale)), mode=mode)
@@ -128,6 +151,7 @@ class RealESRGANModel(SRGANModel):
             if np.random.uniform() < self.opt['gaussian_noise_prob2']:
                 out = random_add_gaussian_noise_pt(
                     out, sigma_range=self.opt['noise_range2'], clip=True, rounds=False, gray_prob=gray_noise_prob)
+                kind+='_gauss'
             else:
                 out = random_add_poisson_noise_pt(
                     out,
@@ -135,6 +159,7 @@ class RealESRGANModel(SRGANModel):
                     gray_prob=gray_noise_prob,
                     clip=True,
                     rounds=False)
+                kind+='_poisson'
 
             # JPEG compression + the final sinc filter
             # We also need to resize images to desired sizes. We group [resize back + sinc filter] together
@@ -152,6 +177,7 @@ class RealESRGANModel(SRGANModel):
                 jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
                 out = torch.clamp(out, 0, 1)
                 out = self.jpeger(out, quality=jpeg_p)
+                kind+='_inter'
             else:
                 # JPEG compression
                 jpeg_p = out.new_zeros(out.size(0)).uniform_(*self.opt['jpeg_range2'])
@@ -161,6 +187,7 @@ class RealESRGANModel(SRGANModel):
                 mode = random.choice(['area', 'bilinear', 'bicubic'])
                 out = F.interpolate(out, size=(ori_h // self.opt['scale'], ori_w // self.opt['scale']), mode=mode)
                 out = filter2D(out, self.sinc_kernel)
+                kind='_jpeg'
 
             # clamp and round
             self.lq = torch.clamp((out * 255.0).round(), 0, 255) / 255.
@@ -205,7 +232,8 @@ class RealESRGANModel(SRGANModel):
             p.requires_grad = False
 
         self.optimizer_g.zero_grad()
-        self.output = self.net_g(self.lq)
+        # self.output = self.net_g(self.lq)
+        self.output= self.forward(self.lq, self.support_set)
 
         l_g_total = 0
         loss_dict = OrderedDict()
@@ -229,6 +257,9 @@ class RealESRGANModel(SRGANModel):
             l_g_gan = self.cri_gan(fake_g_pred, True, is_disc=False)
             l_g_total += l_g_gan
             loss_dict['l_g_gan'] = l_g_gan
+
+            # toDo: contrastive loss
+
 
             l_g_total.backward()
             self.optimizer_g.step()
@@ -256,3 +287,24 @@ class RealESRGANModel(SRGANModel):
             self.model_ema(decay=self.ema_decay)
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
+
+    def forward(self, X, support_set):
+        condition_feature=self.Condition(support_set)
+        condition_feature=self.Modulation(condition_feature)
+        for index,layer in enumerate(self.net_g.modules):
+            if layer=='Conv2d':
+                layer.weight*=condition_feature[index]
+        return self.net_g(X)
+
+
+    def prepare_supportset(self, train_data):
+        self.is_train=True
+        # create LR image and support set
+        index=self.feed_data(train_data)
+        if index in self.support_pool.keys():
+            np.stack([self.support_pool[index], self.lq])
+        else:
+            self.support_pool[index]=self.lq
+        self.is_train=False
+
+
